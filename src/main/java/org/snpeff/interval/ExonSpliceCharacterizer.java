@@ -31,7 +31,7 @@ public class ExonSpliceCharacterizer {
 	Genome genome;
 	HashMap<Exon, Exon.ExonSpliceType> typeByExon;
 	CountByType countByType = new CountByType();
-	int threadCount = 6; // Number of threads in the pool
+	int threadCount = 18; // Number of threads in the pool
 
 	public ExonSpliceCharacterizer(Genome genome) {
 		this.genome = genome;
@@ -191,6 +191,7 @@ public class ExonSpliceCharacterizer {
 
 		// Find retained exons
 		int numExon = 1;
+		int numTr = 1;
 		for (Gene g : genome.getGenes()) {
 			// Count exons
 			CountByType count = new CountByType();
@@ -200,7 +201,6 @@ public class ExonSpliceCharacterizer {
 
 			// Label exons
 			int countTr = g.numChilds();
-			int numTr = 1;
 			for (Transcript tr : g) {
 				if (verbose) Gpr.showMark(numTr++, SHOW_EVERY, "\t");
 				labelExonsTask task = new labelExonsTask(g, tr, countTr, count);
@@ -215,7 +215,7 @@ public class ExonSpliceCharacterizer {
 		    workers[i].start();
 		}
 		try {
-			while (running) {Thread.sleep(1000);}
+			while (running) {Thread.sleep(3000);}
 		}
 		catch(InterruptedException e){
 		}
@@ -228,8 +228,8 @@ public class ExonSpliceCharacterizer {
 		}
 
 		workers = new WorkerThread[threadCount];
+		int numTr = 1;
 		for (Gene g : genome.getGenes()) {
-			int numTr = 1;
 			for (Transcript tr : g) {
 					if (verbose) Gpr.showMark(numTr++, SHOW_EVERY, "\t");
 					exonMutExTask task = new exonMutExTask(g, tr);
@@ -243,7 +243,7 @@ public class ExonSpliceCharacterizer {
 		    workers[i].start();
 		}
 		try {
-			while (running) {Thread.sleep(1000);}
+			while (running) {Thread.sleep(3000);}
 		}
 		catch(InterruptedException e){
 		}

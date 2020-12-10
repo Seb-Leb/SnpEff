@@ -31,7 +31,7 @@ public class ExonSpliceCharacterizer {
 	Genome genome;
 	HashMap<Exon, Exon.ExonSpliceType> typeByExon;
 	CountByType countByType = new CountByType();
-	int threadCount = 18; // Number of threads in the pool
+	int threadCount = 12; // Number of threads in the pool
 
 	public ExonSpliceCharacterizer(Genome genome) {
 		this.genome = genome;

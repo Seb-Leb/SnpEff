@@ -1,6 +1,7 @@
 package org.snpeff.interval;
 
 import java.util.HashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 
 import org.snpeff.interval.Exon.ExonSpliceType;
 import org.snpeff.snpEffect.Config;
@@ -21,10 +22,16 @@ public class ExonSpliceCharacterizer {
 	public static final int MAX_EXONS = 1000; // Do not characterize transcripts having more than this number of exons
 	public static final int SHOW_EVERY = 1000;
 
-	boolean verbose = false;
+	private volatile int threadsCompleted;
+	private WorkerThread[] workers;
+	private ConcurrentLinkedQueue<Runnable> taskQueue;
+	private volatile boolean running;
+
+	boolean verbose = true;
 	Genome genome;
 	HashMap<Exon, Exon.ExonSpliceType> typeByExon;
 	CountByType countByType = new CountByType();
+	int threadCount = 6; // Number of threads in the pool
 
 	public ExonSpliceCharacterizer(Genome genome) {
 		this.genome = genome;
@@ -170,19 +177,21 @@ public class ExonSpliceCharacterizer {
 		this.verbose = verbose;
 	}
 
+	
 	/**
 	 * Mark exons types
 	 */
+	
 	void type() {
 		if (verbose) {
 			Timer.showStdErr("Caracterizing exons by splicing (stage 1) : ");
 			System.out.print("\t");
 		}
+		taskQueue = new ConcurrentLinkedQueue<Runnable>();
 
 		// Find retained exons
 		int numExon = 1;
 		for (Gene g : genome.getGenes()) {
-
 			// Count exons
 			CountByType count = new CountByType();
 			for (Transcript tr : g)
@@ -191,51 +200,52 @@ public class ExonSpliceCharacterizer {
 
 			// Label exons
 			int countTr = g.numChilds();
+			int numTr = 1;
 			for (Transcript tr : g) {
-				for (Exon e : tr) {
-					if (verbose) Gpr.showMark(numExon++, SHOW_EVERY, "\t");
-
-					String eKey = key(e);
-					int countEx = (int) count.get(eKey);
-
-					// Is this exon maintained in all transcripts?
-					if (countEx == countTr) type(e, Exon.ExonSpliceType.RETAINED);
-					else {
-						if (isAlt3ss(e, g)) type(e, Exon.ExonSpliceType.ALTTENATIVE_3SS);
-						else if (isAlt5ss(e, g)) type(e, Exon.ExonSpliceType.ALTTENATIVE_5SS);
-						else if (tr.numChilds() > 1) {
-							if (e.getRank() == 1) type(e, Exon.ExonSpliceType.ALTTENATIVE_PROMOMOTER);
-							else if (e.getRank() == tr.numChilds()) type(e, Exon.ExonSpliceType.ALTTENATIVE_POLY_A);
-							else type(e, Exon.ExonSpliceType.SKIPPED);
-						}
-					}
-				}
+				if (verbose) Gpr.showMark(numTr++, SHOW_EVERY, "\t");
+				labelExonsTask task = new labelExonsTask(g, tr, countTr, count);
+				taskQueue.add(task);
 			}
 		}
+		workers = new WorkerThread[threadCount];
+		running = true;
+		threadsCompleted = 0;
+		for (int i = 0; i < threadCount; i++) {
+		    workers[i] = new WorkerThread();
+		    workers[i].start();
+		}
+		try {
+			while (running) {Thread.sleep(1000);}
+		}
+		catch(InterruptedException e){
+		}
 
+		// Now analyze if there are mutually exclusive exons
 		if (verbose) {
 			System.err.println("");
 			Timer.showStdErr("Caracterizing exons by splicing (stage 2) : ");
 			System.out.print("\t");
 		}
 
-		// Now analyze if there are mutually exclusive exons
-		numExon = 1;
+		workers = new WorkerThread[threadCount];
 		for (Gene g : genome.getGenes()) {
+			int numTr = 1;
 			for (Transcript tr : g) {
-				if (tr.numChilds() < MAX_EXONS) {
-					for (Exon e : tr) {
-						if (verbose) Gpr.showMark(numExon++, SHOW_EVERY, "\t");
-						ExonSpliceType type = typeByExon.get(e);
-						if (type == ExonSpliceType.SKIPPED) { // Try to re-annotate only these
-							if (isMutEx(e, g)) type(e, Exon.ExonSpliceType.MUTUALLY_EXCLUSIVE);
-						}
-					}
-				} else {
-					System.err.println("");
-					Gpr.debug("WARNING: Gene '" + g.getId() + "', transcript '" + tr.getId() + "' has too many exons (" + tr.numChilds() + " exons). Skipped");
-				}
+					if (verbose) Gpr.showMark(numTr++, SHOW_EVERY, "\t");
+					exonMutExTask task = new exonMutExTask(g, tr);
+					taskQueue.add(task);
 			}
+		}
+		running = true;
+		threadsCompleted = 0;
+		for (int i = 0; i < threadCount; i++) {
+		    workers[i] = new WorkerThread();
+		    workers[i].start();
+		}
+		try {
+			while (running) {Thread.sleep(1000);}
+		}
+		catch(InterruptedException e){
 		}
 
 		if (verbose) Timer.showStdErr("done.");
@@ -251,4 +261,85 @@ public class ExonSpliceCharacterizer {
 		countByType.inc(type.toString());
 		typeByExon.put(e, type);
 	}
+
+	synchronized private void threadFinished() {
+	  threadsCompleted++;
+	  if (threadsCompleted == workers.length) { // all threads have finished
+	     running = false; // Make sure running is false after the thread ends.
+	     workers = null;
+	  }
+	}
+
+   	private class labelExonsTask implements Runnable{
+   		Gene g;
+   		Transcript tr;
+   		Exon e;
+   		int countTr;
+   		CountByType count;
+   		labelExonsTask(Gene g, Transcript tr, int countTr, CountByType count){
+   			this.g = g;
+   			this.tr = tr;
+   			this.countTr = countTr;
+   			this.count = count;
+   		}
+   		public void run() {
+			for (Exon e : tr) {
+				String eKey = key(e);
+				int countEx = (int) count.get(eKey);
+
+				// Is this exon maintained in all transcripts?
+				if (countEx == countTr) type(e, Exon.ExonSpliceType.RETAINED);
+				else {
+					if (isAlt3ss(e, g)) type(e, Exon.ExonSpliceType.ALTTENATIVE_3SS);
+					else if (isAlt5ss(e, g)) type(e, Exon.ExonSpliceType.ALTTENATIVE_5SS);
+					else if (tr.numChilds() > 1) {
+						if (e.getRank() == 1) type(e, Exon.ExonSpliceType.ALTTENATIVE_PROMOMOTER);
+						else if (e.getRank() == tr.numChilds()) type(e, Exon.ExonSpliceType.ALTTENATIVE_POLY_A);
+						else type(e, Exon.ExonSpliceType.SKIPPED);
+					}
+				}
+			}
+   		}
+   	}
+
+   	private class exonMutExTask implements Runnable{
+   		Gene g;
+   		Transcript tr;
+   		Exon e;
+   		exonMutExTask(Gene g, Transcript tr){
+   			this.g = g;
+   			this.tr = tr;
+   		}
+   		public void run() {
+   			
+			if (tr.numChilds() < MAX_EXONS) {
+				for (Exon e : tr) {
+					ExonSpliceType type = typeByExon.get(e);
+					if (type == ExonSpliceType.SKIPPED) { // Try to re-annotate only these
+						if (isMutEx(e, g)) type(e, Exon.ExonSpliceType.MUTUALLY_EXCLUSIVE);
+					}
+				}
+			} else {
+				System.err.println("");
+				Gpr.debug("WARNING: Gene '" + g.getId() + "', transcript '" + tr.getId() + "' has too many exons (" + tr.numChilds() + " exons). Skipped");
+			}
+   		}
+   	}
+
+	private class WorkerThread extends Thread {
+	    public void run() {
+	        try {
+	            while (running) {
+	                Runnable task = taskQueue.poll();
+	                if (task == null)
+	                    break;
+	                task.run();
+	            }
+	        }
+	        finally {
+	            threadFinished();
+	        }
+	    }
+	}
+
 }

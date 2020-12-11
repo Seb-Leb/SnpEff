@@ -1,7 +1,7 @@
 package org.snpeff.interval;
 
 import java.util.HashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ArrayBlockingQueue;
 
 import org.snpeff.interval.Exon.ExonSpliceType;
 import org.snpeff.snpEffect.Config;
@@ -24,14 +24,13 @@ public class ExonSpliceCharacterizer {
 
 	private volatile int threadsCompleted;
 	private WorkerThread[] workers;
-	private ConcurrentLinkedQueue<Runnable> taskQueue;
+	private ArrayBlockingQueue<Runnable> taskQueue;
 	private volatile boolean running;
 
 	boolean verbose = true;
 	Genome genome;
 	HashMap<Exon, Exon.ExonSpliceType> typeByExon;
 	CountByType countByType = new CountByType();
-	int threadCount = 12; // Number of threads in the pool
 
 	public ExonSpliceCharacterizer(Genome genome) {
 		this.genome = genome;
@@ -187,10 +186,16 @@ public class ExonSpliceCharacterizer {
 			Timer.showStdErr("Caracterizing exons by splicing (stage 1) : ");
 			System.out.print("\t");
 		}
-		taskQueue = new ConcurrentLinkedQueue<Runnable>();
 
+		taskQueue = new ArrayBlockingQueue<Runnable>(200);
+		int processors = Runtime.getRuntime().availableProcessors();
+		workers = new WorkerThread[processors];
+		for (int i = 0; i < processors; i++) {
+			workers[i] = new WorkerThread();
+		}
+
+		running = true;
 		// Find retained exons
-		int numExon = 1;
 		int numTr = 1;
 		for (Gene g : genome.getGenes()) {
 			// Count exons
@@ -204,18 +209,24 @@ public class ExonSpliceCharacterizer {
 			for (Transcript tr : g) {
 				if (verbose) Gpr.showMark(numTr++, SHOW_EVERY, "\t");
 				labelExonsTask task = new labelExonsTask(g, tr, countTr, count);
-				taskQueue.add(task);
+				try {
+					taskQueue.put(task);
+				}
+				catch(InterruptedException e){
+					e.printStackTrace();
+				}
 			}
 		}
-		workers = new WorkerThread[threadCount];
-		running = true;
-		threadsCompleted = 0;
-		for (int i = 0; i < threadCount; i++) {
-		    workers[i] = new WorkerThread();
-		    workers[i].start();
+		for (int i = 0; i < processors; i++) {
+			try {
+				taskQueue.put(null);
+			}
+			catch(InterruptedException e){
+				e.printStackTrace();
+			}
 		}
 		try {
-			while (running) {Thread.sleep(3000);}
+			while (running) {Thread.sleep(1000);}
 		}
 		catch(InterruptedException e){
 		}
@@ -227,23 +238,30 @@ public class ExonSpliceCharacterizer {
 			System.out.print("\t");
 		}
 
-		workers = new WorkerThread[threadCount];
-		int numTr = 1;
+		running = true;
+		numTr = 1;
 		for (Gene g : genome.getGenes()) {
 			for (Transcript tr : g) {
 					if (verbose) Gpr.showMark(numTr++, SHOW_EVERY, "\t");
 					exonMutExTask task = new exonMutExTask(g, tr);
-					taskQueue.add(task);
+				try {
+					taskQueue.put(task);
+				}
+				catch(InterruptedException e){
+					e.printStackTrace();
+				}
 			}
 		}
-		running = true;
-		threadsCompleted = 0;
-		for (int i = 0; i < threadCount; i++) {
-		    workers[i] = new WorkerThread();
-		    workers[i].start();
+		for (int i = 0; i < processors; i++) {
+			try {
+				taskQueue.put(null);
+			}
+			catch(InterruptedException e){
+				e.printStackTrace();
+			}
 		}
 		try {
-			while (running) {Thread.sleep(3000);}
+			while (running) {Thread.sleep(1000);}
 		}
 		catch(InterruptedException e){
 		}
@@ -266,7 +284,6 @@ public class ExonSpliceCharacterizer {
 	  threadsCompleted++;
 	  if (threadsCompleted == workers.length) { // all threads have finished
 	     running = false; // Make sure running is false after the thread ends.
-	     workers = null;
 	  }
 	}
 
@@ -330,10 +347,15 @@ public class ExonSpliceCharacterizer {
 	    public void run() {
 	        try {
 	            while (running) {
-	                Runnable task = taskQueue.poll();
-	                if (task == null)
-	                    break;
-	                task.run();
+	                try {
+	                	Runnable task = taskQueue.take();
+	                	if (task == null)
+	                		break;
+	                	task.run();
+	                }
+	                catch(InterruptedException e){
+	                	e.printStackTrace();
+	                }
 	            }
 	        }
 	        finally {

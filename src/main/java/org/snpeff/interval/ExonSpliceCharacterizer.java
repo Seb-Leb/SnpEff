@@ -20,12 +20,14 @@ import org.snpeff.util.Timer;
 public class ExonSpliceCharacterizer {
 
 	public static final int MAX_EXONS = 1000; // Do not characterize transcripts having more than this number of exons
-	public static final int SHOW_EVERY = 1000;
+	public static final int SHOW_EVERY = 100;
 
 	private volatile int threadsCompleted;
 	private WorkerThread[] workers;
 	private ArrayBlockingQueue<Runnable> taskQueue;
-	private volatile boolean running;
+	private int taskCount;
+	private volatile int tasksCompleted;
+	private volatile boolean jobInProgress;
 
 	boolean verbose = true;
 	Genome genome;
@@ -187,14 +189,26 @@ public class ExonSpliceCharacterizer {
 			System.out.print("\t");
 		}
 
-		taskQueue = new ArrayBlockingQueue<Runnable>(200);
+		jobInProgress = true;
+		taskCount = 0;
+		tasksCompleted = 0;
+
+		// create the queue and workers
+		taskQueue = new ArrayBlockingQueue<Runnable>(10);
 		int processors = Runtime.getRuntime().availableProcessors();
 		workers = new WorkerThread[processors];
 		for (int i = 0; i < processors; i++) {
 			workers[i] = new WorkerThread();
 		}
 
-		running = true;
+		// wait for the worker to start...
+		try {
+			Thread.sleep(5000);
+		}
+		catch(InterruptedException e){
+			e.printStackTrace();
+		}
+
 		// Find retained exons
 		int numTr = 1;
 		for (Gene g : genome.getGenes()) {
@@ -206,27 +220,26 @@ public class ExonSpliceCharacterizer {
 
 			// Label exons
 			int countTr = g.numChilds();
+
+			Timer.showStdErr("number of trxps: ");
+			System.out.print(countTr);
+			System.out.print("\t");
+
 			for (Transcript tr : g) {
 				if (verbose) Gpr.showMark(numTr++, SHOW_EVERY, "\t");
 				labelExonsTask task = new labelExonsTask(g, tr, countTr, count);
 				try {
+					taskCount++;
 					taskQueue.put(task);
+					Thread.sleep(10);
 				}
 				catch(InterruptedException e){
 					e.printStackTrace();
 				}
 			}
 		}
-		for (int i = 0; i < processors; i++) {
-			try {
-				taskQueue.put(null);
-			}
-			catch(InterruptedException e){
-				e.printStackTrace();
-			}
-		}
 		try {
-			while (running) {Thread.sleep(1000);}
+			while (jobInProgress) {Thread.sleep(1000);}
 		}
 		catch(InterruptedException e){
 		}
@@ -238,13 +251,16 @@ public class ExonSpliceCharacterizer {
 			System.out.print("\t");
 		}
 
-		running = true;
+		jobInProgress = true;
+		taskCount = 0;
+		tasksCompleted = 0;
 		numTr = 1;
 		for (Gene g : genome.getGenes()) {
 			for (Transcript tr : g) {
 					if (verbose) Gpr.showMark(numTr++, SHOW_EVERY, "\t");
 					exonMutExTask task = new exonMutExTask(g, tr);
 				try {
+					taskCount++;
 					taskQueue.put(task);
 				}
 				catch(InterruptedException e){
@@ -252,20 +268,11 @@ public class ExonSpliceCharacterizer {
 				}
 			}
 		}
-		for (int i = 0; i < processors; i++) {
-			try {
-				taskQueue.put(null);
-			}
-			catch(InterruptedException e){
-				e.printStackTrace();
-			}
-		}
 		try {
-			while (running) {Thread.sleep(1000);}
+			while (jobInProgress) {Thread.sleep(1000);}
 		}
 		catch(InterruptedException e){
 		}
-
 		if (verbose) Timer.showStdErr("done.");
 	}
 
@@ -274,18 +281,22 @@ public class ExonSpliceCharacterizer {
 	 * @param e
 	 * @param type
 	 */
-	void type(Exon e, Exon.ExonSpliceType type) {
+	synchronized void type(Exon e, Exon.ExonSpliceType type) {
 		e.spliceType = type;
 		countByType.inc(type.toString());
 		typeByExon.put(e, type);
 	}
 
-	synchronized private void threadFinished() {
-	  threadsCompleted++;
-	  if (threadsCompleted == workers.length) { // all threads have finished
-	     running = false; // Make sure running is false after the thread ends.
-	  }
+	synchronized private void jobFinished() {
+		jobInProgress = false;
 	}
+
+   synchronized private void taskFinished() {
+      tasksCompleted++;
+      if (tasksCompleted == taskCount) { // all threads have finished
+         jobFinished();
+      }
+   }
 
    	private class labelExonsTask implements Runnable{
    		Gene g;
@@ -316,6 +327,7 @@ public class ExonSpliceCharacterizer {
 					}
 				}
 			}
+			taskFinished();
    		}
    	}
 
@@ -328,7 +340,6 @@ public class ExonSpliceCharacterizer {
    			this.tr = tr;
    		}
    		public void run() {
-   			
 			if (tr.numChilds() < MAX_EXONS) {
 				for (Exon e : tr) {
 					ExonSpliceType type = typeByExon.get(e);
@@ -340,28 +351,28 @@ public class ExonSpliceCharacterizer {
 				System.err.println("");
 				Gpr.debug("WARNING: Gene '" + g.getId() + "', transcript '" + tr.getId() + "' has too many exons (" + tr.numChilds() + " exons). Skipped");
 			}
+			taskFinished();
    		}
    	}
 
-	private class WorkerThread extends Thread {
-	    public void run() {
-	        try {
-	            while (running) {
-	                try {
-	                	Runnable task = taskQueue.take();
-	                	if (task == null)
-	                		break;
-	                	task.run();
-	                }
-	                catch(InterruptedException e){
-	                	e.printStackTrace();
-	                }
-	            }
-	        }
-	        finally {
-	            threadFinished();
-	        }
-	    }
-	}
-
+   private class WorkerThread extends Thread {
+      WorkerThread() {
+         try {
+            setDaemon(true);
+         }
+         catch (Exception e) {
+         }
+         start();
+      }
+      public void run() {
+         while (true) {
+            try {
+               Runnable task = taskQueue.take();
+               task.run();
+            }
+            catch (InterruptedException e) {
+            }
+         }
+      }
+   }
 }

@@ -1,6 +1,6 @@
 package org.snpeff.interval;
 
-import java.util.HashMap;
+import java.util.*;
 import java.util.concurrent.ArrayBlockingQueue;
 
 import org.snpeff.interval.Exon.ExonSpliceType;
@@ -19,7 +19,7 @@ import org.snpeff.util.Timer;
  */
 public class ExonSpliceCharacterizer {
 
-	public static final int MAX_EXONS = 1000; // Do not characterize transcripts having more than this number of exons
+	public static final int MAX_EXONS = 10000; // Do not characterize transcripts having more than this number of exons
 	public static final int SHOW_EVERY = 100;
 
 	private volatile int threadsCompleted;
@@ -28,6 +28,8 @@ public class ExonSpliceCharacterizer {
 	private int taskCount;
 	private volatile int tasksCompleted;
 	private volatile boolean jobInProgress;
+
+	Set<String> nonMutExSet = new HashSet<>();
 
 	boolean verbose = true;
 	Genome genome;
@@ -129,19 +131,21 @@ public class ExonSpliceCharacterizer {
 	 * @param gene
 	 * @return
 	 */
-	boolean isMutEx(Exon exon, Gene gene) {
+	boolean isMutEx(Exon exon, Gene gene, HashMap<String, Exon> uniqEx) {
 		if (gene.numChilds() <= 1) return false;
-
+		String exonKey = key(exon);
 		//---
 		// Make a list of all unique exons
 		//---
-		String exonKey = key(exon);
+		/*
+		
 		HashMap<String, Exon> uniqEx = new HashMap<String, Exon>();
 		for (Transcript tr : gene)
 			for (Exon e : tr) {
 				String ekey = key(e);
 				if (!exonKey.equals(ekey)) uniqEx.put(ekey, e);
 			}
+		*/
 
 		//---
 		// For each unique exon, compare if it is mutually exclusive with 'exon'
@@ -149,14 +153,13 @@ public class ExonSpliceCharacterizer {
 		Transcript exonTr = (Transcript) exon.getParent();
 		for (Exon e : uniqEx.values()) {
 			ExonSpliceType type = typeByExon.get(e);;
-			if (type == Exon.ExonSpliceType.SKIPPED) { // Only check for these exons (avoid all ALT*)
+			if (type == Exon.ExonSpliceType.SKIPPED && key(e) != exonKey) { // Only check for these exons (avoid all ALT*)
 				boolean xor = true;
 				for (Transcript tr : gene) {
 					if (exonTr.intersects(tr) && exon.intersects(tr) && e.intersects(exonTr)) { // Make sure both exons intersect both transcripts (otherwise they cannot be mutually exclusive)
 						xor &= intersectsAnyExon(e, tr) ^ intersectsAnyExon(exon, tr);
 					} else xor = false;
 				}
-
 				// XOR is true? => Mutually exclusive
 				if (xor) return true;
 			}
@@ -238,8 +241,9 @@ public class ExonSpliceCharacterizer {
 				}
 			}
 		}
+
 		try {
-			while (jobInProgress) {Thread.sleep(1000);}
+			while (jobInProgress) {Thread.sleep(5000);}
 		}
 		catch(InterruptedException e){
 		}
@@ -254,14 +258,40 @@ public class ExonSpliceCharacterizer {
 		jobInProgress = true;
 		taskCount = 0;
 		tasksCompleted = 0;
+
+		// create the queue and workers
+		taskQueue = new ArrayBlockingQueue<Runnable>(10);
+		workers = new WorkerThread[processors];
+		for (int i = 0; i < processors; i++) {
+			workers[i] = new WorkerThread();
+		}
+
+		// wait for the worker to start...
+		try {
+			Thread.sleep(5000);
+		}
+		catch(InterruptedException e){
+			e.printStackTrace();
+		}
+
 		numTr = 1;
 		for (Gene g : genome.getGenes()) {
+			System.out.print(g.numChilds());
+
+			HashMap<String, Exon> uniqEx = new HashMap<String, Exon>();
+			for (Transcript tr : g)
+				for (Exon e : tr) {
+					String ekey = key(e);
+					uniqEx.put(ekey, e);
+				}
+
 			for (Transcript tr : g) {
-					if (verbose) Gpr.showMark(numTr++, SHOW_EVERY, "\t");
-					exonMutExTask task = new exonMutExTask(g, tr);
+				if (verbose) Gpr.showMark(numTr++, SHOW_EVERY, "\t");
+				exonMutExTask task = new exonMutExTask(g, tr, uniqEx);
 				try {
 					taskCount++;
 					taskQueue.put(task);
+					Thread.sleep(10);
 				}
 				catch(InterruptedException e){
 					e.printStackTrace();
@@ -331,20 +361,32 @@ public class ExonSpliceCharacterizer {
    		}
    	}
 
+	
+	synchronized void addToNonMutExSet(String eKey) {
+		nonMutExSet.add(eKey);
+	}
+
    	private class exonMutExTask implements Runnable{
    		Gene g;
    		Transcript tr;
    		Exon e;
-   		exonMutExTask(Gene g, Transcript tr){
+		HashMap<String, Exon> uniqEx;
+   		exonMutExTask(Gene g, Transcript tr, HashMap<String, Exon> uniqEx){
    			this.g = g;
    			this.tr = tr;
+   			this.uniqEx = uniqEx;
    		}
    		public void run() {
 			if (tr.numChilds() < MAX_EXONS) {
 				for (Exon e : tr) {
 					ExonSpliceType type = typeByExon.get(e);
-					if (type == ExonSpliceType.SKIPPED) { // Try to re-annotate only these
-						if (isMutEx(e, g)) type(e, Exon.ExonSpliceType.MUTUALLY_EXCLUSIVE);
+					if (type == ExonSpliceType.SKIPPED && !nonMutExSet.contains(key(e))) { // Try to re-annotate only these
+						if (isMutEx(e, g, uniqEx)) {
+							type(e, Exon.ExonSpliceType.MUTUALLY_EXCLUSIVE);
+						}
+						else {
+							addToNonMutExSet(key(e));
+						}
 					}
 				}
 			} else {
